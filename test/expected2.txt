@@ -1,0 +1,8 @@
+Root Entry
+┣ A
+┣ B
+┃┣ D
+┃┣ E
+┃┣ F
+┃┗ G
+┗ C

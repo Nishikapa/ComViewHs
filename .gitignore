@@ -1,0 +1,13 @@
+# GHC build artifacts
+*.hi
+*.o
+comview
+comview.exe
+
+# Local package environment / cabal
+.ghc.environment.*
+dist-newstyle/
+
+# Test artifacts
+test/out/
+.build-test/

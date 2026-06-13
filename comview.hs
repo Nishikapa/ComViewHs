@@ -1,324 +1,228 @@
-﻿
-import Data.ByteString.Lazy as L (take, empty, append, drop, fromStrict, readFile, ByteString)
-import Data.ByteString      as B (take, ByteString)
-import Data.Word                 (Word8, Word16, Word32, Word64)
-import Data.Binary.Get           (skip, getWord8, getWord16le, getWord32le, getWord64le, getByteString, isEmpty, runGet, Get)
-import Data.List                 (head, tail, last, init, null, reverse, takeWhile)
-import Data.Text.Encoding        (decodeUtf16LE)
-import Data.Text                 (unpack, Text)
-import Data.UUID                 (fromByteString, UUID)
-import System.Environment        (getArgs)
+{- cabal:
+build-depends: base, binary, bytestring, text, uuid
+-}
 
--- 共通系関数 ------------------------------------------------------------------------------------
+-- comview: 複合ファイル (MS-CFB) のディレクトリ構造をツリー表示するツール
+-- 仕様: https://learn.microsoft.com/openspecs/windows_protocols/ms-cfb/
+module Main (main) where
 
-prints :: Show a => [a] -> IO ()
+import           Control.Monad        (replicateM)
+import           Data.Binary.Get      (Get, getByteString, getWord16le,
+                                       getWord32le, getWord64le, getWord8,
+                                       isEmpty, runGet)
+import qualified Data.ByteString      as B
+import qualified Data.ByteString.Lazy as L
+import           Data.Int             (Int64)
+import           Data.Text            (Text, unpack)
+import           Data.Text.Encoding   (decodeUtf16LE)
+import           Data.UUID            (UUID, fromByteString)
+import           Data.Word            (Word16, Word32, Word64, Word8)
+import           System.Environment   (getArgs)
+import           System.Exit          (die)
 
-prints [] = do
-    return ()
+-- 定数 (MS-CFB 2.1, 2.2) -------------------------------------------------------------------------
 
-prints (a:as) = do
-    print a
-    prints as
+-- セクタサイズ。バージョン 3 (sectorShift = 9) の 512 バイト固定
+sectorSize :: Int64
+sectorSize = 512
 
-getList :: Get a -> Int -> Get [a]
-getList g i = do
-    if i == 0
+-- これ以下の値だけが実セクタ番号。それ以外は DIFSECT/FATSECT/ENDOFCHAIN/FREESECT などの特殊値
+maxRegularSector :: Word32
+maxRegularSector = 0xFFFFFFFA
+
+isRegularSector :: Word32 -> Bool
+isRegularSector = (<= maxRegularSector)
+
+-- FREESECT (未使用 DIFAT エントリ) と NOSTREAM (ディレクトリ ID なし) は同じ値
+freeSector, noStream :: Word32
+freeSector = 0xFFFFFFFF
+noStream   = 0xFFFFFFFF
+
+-- 共通パーサ --------------------------------------------------------------------------------------
+
+-- 入力を使い切るまで g を繰り返す
+getUntilEmpty :: Get a -> Get [a]
+getUntilEmpty g = do
+    done <- isEmpty
+    if done
         then return []
-        else 
-            do 
-                item    <- g
-                items   <- getList g (i - 1)
-                return ( item : items )
+        else (:) <$> g <*> getUntilEmpty g
 
-getWord32leList =  
-    getList getWord32le
+getAllWord32le :: Get [Word32]
+getAllWord32le = getUntilEmpty getWord32le
 
-getList2 :: Get a -> Get [a]
-getList2 g = 
-    do
-        empty <- isEmpty
-        if empty
-        then 
-            return []
-        else 
-            do 
-                a <- g
-                as <- getList2 g
-                return (a:as)
+getMaybeUUID :: Get (Maybe UUID)
+getMaybeUUID = fromByteString . L.fromStrict <$> getByteString 16
 
-getWord32leList2 =  
-    getList2 getWord32le
-
--- CompoundFileHeader ----------------------------------------------------------------------------
+-- CompoundFileHeader ------------------------------------------------------------------------------
 
 data CompoundFileHeader = CompoundFileHeader
-    {
-        headerSignature              :: !B.ByteString,
-        headerCLSID                  :: !(Maybe UUID),
-        minorVersion                 :: !Word16,
-        majorVersion                 :: !Word16,
-        byteOrder                    :: !Word16,
-        sectorShift                  :: !Word16,
-        miniSectorShift              :: !Word16,
-        reserved                     :: !B.ByteString,
-        numberofDirectorySectors     :: !Word32,
-        numberofFATSectors           :: !Word32,
-        firstDirectorySectorLocation :: !Word32,
-        transactionSignatureNumber   :: !Word32,
-        miniStreamCutoffSize         :: !Word32,
-        firstMiniFATSectorLocation   :: !Word32,
-        numberofMiniFATSectors       :: !Word32,
-        firstDIFATSectorLocation     :: !Word32,
-        numberofDIFATSectors         :: !Word32,
-        difats                       :: ![Word32]
+    { headerSignature              :: !B.ByteString
+    , headerCLSID                  :: !(Maybe UUID)
+    , minorVersion                 :: !Word16
+    , majorVersion                 :: !Word16
+    , byteOrder                    :: !Word16
+    , sectorShift                  :: !Word16
+    , miniSectorShift              :: !Word16
+    , reserved                     :: !B.ByteString
+    , numberOfDirectorySectors     :: !Word32
+    , numberOfFATSectors           :: !Word32
+    , firstDirectorySectorLocation :: !Word32
+    , transactionSignatureNumber   :: !Word32
+    , miniStreamCutoffSize         :: !Word32
+    , firstMiniFATSectorLocation   :: !Word32
+    , numberOfMiniFATSectors       :: !Word32
+    , firstDIFATSectorLocation     :: !Word32
+    , numberOfDIFATSectors         :: !Word32
+    , headerDIFAT                  :: ![Word32]
     } deriving (Show)
 
-getCompoundFileHeader :: L.ByteString -> CompoundFileHeader
-getCompoundFileHeader allFileData = 
+getCompoundFileHeader :: Get CompoundFileHeader
+getCompoundFileHeader = CompoundFileHeader
+    <$> getByteString 8         -- headerSignature
+    <*> getMaybeUUID            -- headerCLSID
+    <*> getWord16le             -- minorVersion
+    <*> getWord16le             -- majorVersion
+    <*> getWord16le             -- byteOrder
+    <*> getWord16le             -- sectorShift
+    <*> getWord16le             -- miniSectorShift
+    <*> getByteString 6         -- reserved
+    <*> getWord32le             -- numberOfDirectorySectors
+    <*> getWord32le             -- numberOfFATSectors
+    <*> getWord32le             -- firstDirectorySectorLocation
+    <*> getWord32le             -- transactionSignatureNumber
+    <*> getWord32le             -- miniStreamCutoffSize
+    <*> getWord32le             -- firstMiniFATSectorLocation
+    <*> getWord32le             -- numberOfMiniFATSectors
+    <*> getWord32le             -- firstDIFATSectorLocation
+    <*> getWord32le             -- numberOfDIFATSectors
+    <*> replicateM 109 getWord32le  -- headerDIFAT
 
-    let get = do
-        headerSignature              <- getByteString 8
-        headerCLSID                  <- getByteString 16
-        minorVersion                 <- getWord16le
-        majorVersion                 <- getWord16le
-        byteOrder                    <- getWord16le
-        sectorShift                  <- getWord16le
-        miniSectorShift              <- getWord16le
-        reserved                     <- getByteString 6
-        numberofDirectorySectors     <- getWord32le
-        numberofFATSectors           <- getWord32le
-        firstDirectorySectorLocation <- getWord32le
-        transactionSignatureNumber   <- getWord32le
-        miniStreamCutoffSize         <- getWord32le
-        firstMiniFATSectorLocation   <- getWord32le
-        numberofMiniFATSectors       <- getWord32le
-        firstDIFATSectorLocation     <- getWord32le
-        numberofDIFATSectors         <- getWord32le
-        difats                       <- getWord32leList 109
-
-        return $! CompoundFileHeader 
-            headerSignature 
-            (fromByteString $ fromStrict headerCLSID)
-            minorVersion 
-            majorVersion 
-            byteOrder 
-            sectorShift 
-            miniSectorShift 
-            reserved 
-            numberofDirectorySectors 
-            numberofFATSectors 
-            firstDirectorySectorLocation 
-            transactionSignatureNumber 
-            miniStreamCutoffSize 
-            firstMiniFATSectorLocation 
-            numberofMiniFATSectors 
-            firstDIFATSectorLocation 
-            numberofDIFATSectors 
-            difats
-
-    in  runGet get allFileData
-
-
--- DirectoryEntry --------------------------------------------------------------------------------
+-- DirectoryEntry ----------------------------------------------------------------------------------
 
 data DirectoryEntry = DirectoryEntry
-    {
-        directoryEntryName          :: !Text,
-        directoryEntryNameLength    :: !Word16,
-        objectType                  :: !Word8,
-        colorFlag                   :: !Word8,
-        leftSiblingID               :: !Word32,
-        rightSiblingID              :: !Word32,
-        childID                     :: !Word32,
-        clsid                       :: !(Maybe UUID),
-        stateBits                   :: !Word32,
-        creationTime                :: !Word64,
-        modifiedTime                :: !Word64,
-        startingSectorLocation      :: !Word32,
-        streamSize                  :: !Word64
+    { directoryEntryName       :: !Text
+    , directoryEntryNameLength :: !Word16
+    , objectType               :: !Word8
+    , colorFlag                :: !Word8
+    , leftSiblingID            :: !Word32
+    , rightSiblingID           :: !Word32
+    , childID                  :: !Word32
+    , clsid                    :: !(Maybe UUID)
+    , stateBits                :: !Word32
+    , creationTime             :: !Word64
+    , modifiedTime             :: !Word64
+    , startingSectorLocation   :: !Word32
+    , streamSize               :: !Word64
     } deriving (Show)
 
 getDirectoryEntry :: Get DirectoryEntry
 getDirectoryEntry = do
+    rawName    <- getByteString 64
+    nameLength <- getWord16le
+    DirectoryEntry (decodeEntryName rawName nameLength) nameLength
+        <$> getWord8        -- objectType
+        <*> getWord8        -- colorFlag
+        <*> getWord32le     -- leftSiblingID
+        <*> getWord32le     -- rightSiblingID
+        <*> getWord32le     -- childID
+        <*> getMaybeUUID    -- clsid
+        <*> getWord32le     -- stateBits
+        <*> getWord64le     -- creationTime
+        <*> getWord64le     -- modifiedTime
+        <*> getWord32le     -- startingSectorLocation
+        <*> getWord64le     -- streamSize
 
-    directoryEntryName          <- getByteString 64
-    directoryEntryNameLength    <- getWord16le
-    objectType                  <- getWord8
-    colorFlag                   <- getWord8
-    leftSiblingID               <- getWord32le
-    rightSiblingID              <- getWord32le
-    childID                     <- getWord32le
-    clsid                       <- getByteString 16 
-    stateBits                   <- getWord32le
-    creationTime                <- getWord64le
-    modifiedTime                <- getWord64le
-    startingSectorLocation      <- getWord32le
-    streamSize                  <- getWord64le
+-- 名前は UTF-16LE。長さは終端 NUL の 2 バイトを含む
+decodeEntryName :: B.ByteString -> Word16 -> Text
+decodeEntryName raw len = decodeUtf16LE $ B.take (fromIntegral len - 2) raw
 
-    return $! DirectoryEntry
-        (decodeUtf16LE  $ B.take (fromIntegral directoryEntryNameLength - 2) directoryEntryName)
-        directoryEntryNameLength
-        objectType
-        colorFlag
-        leftSiblingID
-        rightSiblingID
-        childID
-        (fromByteString $ fromStrict clsid)
-        stateBits
-        creationTime
-        modifiedTime
-        startingSectorLocation
-        streamSize
+getAllDirectoryEntries :: L.ByteString -> [Word32] -> CompoundFileHeader -> [DirectoryEntry]
+getAllDirectoryEntries fileData fat header =
+    runGet (getUntilEmpty getDirectoryEntry) $
+        getStreamData fileData fat (firstDirectorySectorLocation header)
 
-getAllDirectoryEntries :: L.ByteString -> [DirectoryEntry]
-getAllDirectoryEntries allFileData = 
-
-    let header = getCompoundFileHeader allFileData
-        stream = getStreamData allFileData $ firstDirectorySectorLocation header
-    in runGet ( getList2 getDirectoryEntry ) stream
-
+-- left/right sibling の木を中順にたどり、同じ階層のエントリ ID を名前順で列挙する
 siblingDirectoryEntryIds :: [DirectoryEntry] -> Word32 -> [Word32]
-siblingDirectoryEntryIds allDirectoryEntries index =
-    if 0xFFFFFFFF == index 
-    then
-        []
-    else
-        let current = allDirectoryEntries !! (fromIntegral index)
-            left = siblingDirectoryEntryIds allDirectoryEntries (leftSiblingID current)
-            right = siblingDirectoryEntryIds allDirectoryEntries (rightSiblingID current)
-        in left ++ ( index : right)
+siblingDirectoryEntryIds entries entryId
+    | entryId == noStream = []
+    | otherwise           = left ++ entryId : right
+  where
+    entry = entries !! fromIntegral entryId
+    left  = siblingDirectoryEntryIds entries (leftSiblingID entry)
+    right = siblingDirectoryEntryIds entries (rightSiblingID entry)
 
-printDirectoryEntries :: (Word32 -> Text) -> (Word32 -> [Word32]) -> [Bool] -> Word32 -> IO ()
-printDirectoryEntries  p children lines currentid = do
+-- DIFAT -------------------------------------------------------------------------------------------
 
-    if null lines
-    then 
-        return ()
-    else
-        do
-            mapM_   ( \f -> putStr  $ if f then "　" else "┃" ) 
-                    (reverse $ tail lines)
+-- ヘッダに収まらない分の DIFAT。各 DIFAT セクタの末尾エントリは次の DIFAT セクタ番号
+sectorDIFAT :: L.ByteString -> Word32 -> [Word32]
+sectorDIFAT fileData sector
+    | isRegularSector sector = init entries ++ sectorDIFAT fileData (last entries)
+    | otherwise              = []
+  where
+    entries = runGet getAllWord32le (getSectorData fileData sector)
 
-            putStr $ if head lines then "┗ " else "┣ "
+allDIFAT :: L.ByteString -> CompoundFileHeader -> [Word32]
+allDIFAT fileData header =
+    takeWhile (/= freeSector) $
+        headerDIFAT header ++ sectorDIFAT fileData (firstDIFATSectorLocation header)
 
-    putStrLn $ unpack  $ p currentid
+-- FAT ---------------------------------------------------------------------------------------------
 
-    if null $ children currentid 
-    then
-        return ()
-    else
-        do
-            let c = children currentid
-                f = printDirectoryEntries  p children (False:lines) 
-                initc = init c
-            mapM_ f initc
-            printDirectoryEntries  p children (True:lines) (last $ children currentid)
+-- DIFAT が指す全 FAT セクタを連結した、ファイル全体の FAT
+getFATs :: L.ByteString -> CompoundFileHeader -> [Word32]
+getFATs fileData header =
+    allDIFAT fileData header >>= runGet getAllWord32le . getSectorData fileData
 
+-- セクタ / ストリーム読み出し ----------------------------------------------------------------------
 
--- DIFAT -----------------------------------------------------------------------------------------
-
-sectorDifats :: L.ByteString -> Word32 -> [Word32]
-sectorDifats allFileData sectorIndex =
-    if 0xFFFFFFFF == sectorIndex
-    then
-        []
-    else
-        let sectorData = getSectorData allFileData sectorIndex
-            difats = runGet getWord32leList2 sectorData
-            nextdifats = sectorDifats allFileData (last difats)
-        in (init difats) ++ nextdifats
-
-allDifats :: L.ByteString -> [Word32]
-allDifats allFileData =
-    let header = getCompoundFileHeader allFileData
-        headerDifats = difats header
-        firstSectorIndex = firstDIFATSectorLocation header
-        serctorDifats = sectorDifats allFileData firstSectorIndex
-        compositeDifats = headerDifats ++ serctorDifats
-    in takeWhile ( < 0xFFFFFFFF ) compositeDifats
-
-
--- FAT -------------------------------------------------------------------------------------------
-
-getFATsFromOneDifat :: L.ByteString -> Word32 -> [Word32]
-getFATsFromOneDifat allFileData difat = 
-    let get = do
-        skip ( 512 * (1 + fromIntegral difat) )
-        getWord32leList 128
-    in  runGet get allFileData
-
-getFATs :: L.ByteString -> [Word32]
-getFATs allFileData =
-    let header = getCompoundFileHeader allFileData
-    in  (allDifats allFileData) >>= 
-        (   \difat -> 
-                if (difat < 0xFFFFFFFF) 
-                then 
-                    ( getFATsFromOneDifat allFileData difat ) 
-                else 
-                [] 
-        )
-
-
--- MiniFAT ---------------------------------------------------------------------------------------
-
-getMiniFATs :: L.ByteString -> [Word32]
-getMiniFATs allSectorData = 
-    let header = getCompoundFileHeader allSectorData
-        stream = getStreamData allSectorData $ firstMiniFATSectorLocation header
-    in runGet getWord32leList2 stream
-
-getMiniFATStream :: L.ByteString -> L.ByteString
-getMiniFATStream allFileData = 
-    let allDirectoryEntries = getAllDirectoryEntries allFileData
-        rootDirectoryEntry = head allDirectoryEntries
-        s = startingSectorLocation rootDirectoryEntry
-    in getStreamData allFileData s
-
-
--- GetSectorData ---------------------------------------------------------------------------------
-
+-- セクタ番号は本体 (ヘッダの直後) からの通し番号
 getSectorData :: L.ByteString -> Word32 -> L.ByteString
-getSectorData allFileData sector =
-    let data1 = L.drop ( 512 * (1 + fromIntegral sector)) allFileData
-        data2 = L.take 512 data1
-    in data2
+getSectorData fileData sector =
+    L.take sectorSize $ L.drop (sectorSize * (1 + fromIntegral sector)) fileData
 
+-- FAT のチェーンをたどってストリーム全体を読む
+getStreamData :: L.ByteString -> [Word32] -> Word32 -> L.ByteString
+getStreamData fileData fat = go
+  where
+    go sector
+        | isRegularSector sector =
+            getSectorData fileData sector `L.append` go (fat !! fromIntegral sector)
+        | otherwise = L.empty
 
--- Stream ----------------------------------------------------------------------------------------
+-- ツリー表示 ----------------------------------------------------------------------------------------
 
-getStreamData :: L.ByteString -> Word32 -> L.ByteString
-getStreamData allFileData firstSector =
-    
-    let fat = getFATs allFileData
-        firstdata = getSectorData allFileData firstSector
-        next = fat !! fromIntegral firstSector
-        nextdata = 
-            if  next < 0xFFFFFFFB
-                then 
-                    getStreamData allFileData next
-                else
-                    L.empty
+-- isLastFlags は各祖先階層で「最後の子か」のフラグ (直近の階層が先頭、ルートでは空)
+printDirectoryTree :: (Word32 -> Text) -> (Word32 -> [Word32]) -> [Bool] -> Word32 -> IO ()
+printDirectoryTree nameOf childrenOf isLastFlags entryId = do
+    putStrLn $ branchPrefix isLastFlags ++ unpack (nameOf entryId)
+    case childrenOf entryId of
+        [] -> return ()
+        cs -> do
+            mapM_ (printDirectoryTree nameOf childrenOf (False : isLastFlags)) (init cs)
+            printDirectoryTree nameOf childrenOf (True : isLastFlags) (last cs)
 
-    in L.append firstdata nextdata
+branchPrefix :: [Bool] -> String
+branchPrefix []                  = ""
+branchPrefix (isLast : parents)  =
+    concatMap (\lastChild -> if lastChild then "　" else "┃") (reverse parents)
+        ++ if isLast then "┗ " else "┣ "
 
+-- Main ----------------------------------------------------------------------------------------------
 
--- Main ------------------------------------------------------------------------------------------
-
-main = do 
-
+main :: IO ()
+main = do
     args <- getArgs
+    case args of
+        [path] -> printCompoundFile =<< L.readFile path
+        _      -> die "usage: comview <compound file>"
 
-    allFileData <- L.readFile $ head args
-
-    let allDirectoryEntries = 
-            getAllDirectoryEntries allFileData
-
-    let childIds id = 
-            siblingDirectoryEntryIds allDirectoryEntries $ childID $ allDirectoryEntries !! fromIntegral id
-
-    printDirectoryEntries 
-        (directoryEntryName.(allDirectoryEntries !!).fromIntegral) 
-        childIds
-        [] 
-        0 
+printCompoundFile :: L.ByteString -> IO ()
+printCompoundFile fileData =
+    let header     = runGet getCompoundFileHeader fileData
+        fat        = getFATs fileData header
+        entries    = getAllDirectoryEntries fileData fat header
+        entryAt    = (entries !!) . fromIntegral
+        nameOf     = directoryEntryName . entryAt
+        childrenOf = siblingDirectoryEntryIds entries . childID . entryAt
+    in printDirectoryTree nameOf childrenOf [] 0

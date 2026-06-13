@@ -1,0 +1,4 @@
+Root Entry
+┣ StreamA
+┗ Storage1
+　┗ StreamB
